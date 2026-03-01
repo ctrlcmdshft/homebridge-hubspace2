@@ -1,0 +1,60 @@
+{
+  "name": "homebridge-hubspace2",
+  "version": "1.0.0",
+  "description": "Homebridge plugin for Hubspace smart home devices (lights, fans, switches, thermostats, locks)",
+  "license": "MIT",
+  "displayName": "Hubspace",
+  "author": "ctrlcmdshft",
+  "homepage": "https://github.com/ctrlcmdshft/homebridge-hubspace2#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ctrlcmdshft/homebridge-hubspace2.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ctrlcmdshft/homebridge-hubspace2/issues"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "rimraf ./dist && tsc",
+    "watch": "nodemon",
+    "lint": "eslint src/ --max-warnings=0",
+    "prepublishOnly": "npm run lint && npm run build"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "hubspace",
+    "homekit",
+    "smart-home",
+    "home-automation",
+    "hampton-bay",
+    "ecosmart",
+    "defiant",
+    "home-depot",
+    "afero",
+    "fan",
+    "light",
+    "switch",
+    "thermostat",
+    "lock"
+  ],
+  "engines": {
+    "node": ">=20.0.0",
+    "homebridge": ">=1.8.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "homebridge": "^1.8.0",
+    "nodemon": "^3.0.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "homebridge": ">=1.8.0"
+  }
+}

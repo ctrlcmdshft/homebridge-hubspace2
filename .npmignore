@@ -1,0 +1,14 @@
+# Source — only ship the compiled dist/
+src/
+*.ts
+!dist/**
+
+# Dev config
+.eslintrc.json
+.nodemonrc.json
+tsconfig.json
+.github/
+
+# Misc
+.gitignore
+*.map

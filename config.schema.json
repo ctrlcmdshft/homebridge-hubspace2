@@ -1,0 +1,63 @@
+{
+  "pluginAlias": "HubspacePlatform",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "required": ["username", "password"],
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "title": "Plugin Name",
+        "type": "string",
+        "default": "Hubspace"
+      },
+      "username": {
+        "title": "Hubspace Username (Email)",
+        "type": "string",
+        "format": "email"
+      },
+      "password": {
+        "title": "Hubspace Password",
+        "type": "string"
+      },
+      "pollingInterval": {
+        "title": "Polling Interval (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 10,
+        "description": "How often to poll Hubspace cloud for device state updates."
+      },
+      "temperatureUnit": {
+        "title": "Temperature Unit",
+        "type": "string",
+        "default": "fahrenheit",
+        "oneOf": [
+          { "title": "Fahrenheit", "enum": ["fahrenheit"] },
+          { "title": "Celsius", "enum": ["celsius"] }
+        ],
+        "description": "Temperature unit used when communicating with the Hubspace API."
+      },
+      "otp": {
+        "title": "One-Time Password (OTP)",
+        "type": "string",
+        "description": "Only needed on first login if your account uses email 2FA. Add the code from your email, restart Homebridge once, then remove this field. The refresh token is saved automatically after a successful login."
+      },
+      "debug": {
+        "title": "Enable Debug Logging",
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "layout": [
+    { "key": "username", "type": "email" },
+    { "key": "password", "type": "password" },
+    {
+      "type": "fieldset",
+      "title": "Advanced Options",
+      "expandable": true,
+      "items": ["pollingInterval", "temperatureUnit", "otp", "debug"]
+    }
+  ]
+}
