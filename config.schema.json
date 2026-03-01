@@ -41,7 +41,7 @@
       "otp": {
         "title": "One-Time Password (OTP)",
         "type": "string",
-        "description": "Only needed on first login if your account uses email 2FA. Add the code from your email, restart Homebridge once, then remove this field. The refresh token is saved automatically after a successful login."
+        "description": "Only needed if your account has email 2FA. Hubspace will email you a code after your first login attempt fails. Add it here and restart. Remove it after a successful login — the refresh token is saved automatically."
       },
       "debug": {
         "title": "Enable Debug Logging",

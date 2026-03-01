@@ -5,12 +5,9 @@ import { HUBSPACE_API } from '../settings';
 import type { AuthState, DeviceState, DeviceStateValue, HubspaceDevice } from './types';
 import type { Logger } from 'homebridge';
 
-/** Thrown when the API needs an OTP but none was supplied. */
+/** Thrown when the server requires an OTP and none was supplied. */
 export class OtpRequiredError extends Error {
-  constructor() {
-    super('OTP_REQUIRED');
-    this.name = 'OtpRequiredError';
-  }
+  constructor() { super('OTP_REQUIRED'); this.name = 'OtpRequiredError'; }
 }
 
 export class HubspaceApi {
@@ -25,7 +22,6 @@ export class HubspaceApi {
     private readonly log: Logger,
     storagePath: string,
     private readonly temperatureUnit: 'fahrenheit' | 'celsius' = 'fahrenheit',
-    /** OTP code – only needed on first login when the account uses email 2FA */
     private readonly otp?: string,
   ) {
     this.store = new TokenStore(storagePath);
@@ -60,13 +56,11 @@ export class HubspaceApi {
     }
 
     // 3. Full login with username + password (+ optional OTP)
-    this.log.debug('[HubspaceApi] Performing full login');
+    this.log.debug('[HubspaceApi] Logging in');
     try {
       this.auth = await login(this.username, this.password, this.otp, (msg) => this.log.debug(msg));
     } catch (err) {
-      if (err instanceof Error && err.message === 'OTP_REQUIRED') {
-        throw new OtpRequiredError();
-      }
+      if (err instanceof Error && err.message === 'OTP_REQUIRED') throw new OtpRequiredError();
       throw err;
     }
     this.store.save(this.auth);

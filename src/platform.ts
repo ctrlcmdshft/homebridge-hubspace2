@@ -19,7 +19,6 @@ import { ThermostatAccessory } from './accessories/thermostatAccessory';
 import { LockAccessory } from './accessories/lockAccessory';
 import { ValveAccessory } from './accessories/valveAccessory';
 
-/** Maps Hubspace deviceClass → accessory constructor */
 type AccessoryCtor = new (platform: HubspacePlatform, accessory: PlatformAccessory) => BaseAccessory;
 
 const CLASS_MAP: Record<string, AccessoryCtor> = {
@@ -43,11 +42,8 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
   public readonly hubspaceApi: HubspaceApi;
   public readonly temperatureUnit: 'fahrenheit' | 'celsius';
 
-  /** Cached accessories restored from disk */
   private readonly cachedAccessories = new Map<string, PlatformAccessory>();
-  /** Active accessory handlers (UUID → handler) */
   private readonly accessories = new Map<string, BaseAccessory>();
-
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -74,22 +70,15 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
       this.startPolling();
     });
 
-    this.api.on('shutdown', () => {
-      this.stopPolling();
-    });
+    this.api.on('shutdown', () => this.stopPolling());
 
     log.debug('Hubspace platform initialized');
   }
 
-  // ── Homebridge lifecycle ────────────────────────────────────────────────────
-
-  /** Called by Homebridge for each accessory found in the cache at startup */
   configureAccessory(accessory: PlatformAccessory): void {
     this.log.debug(`Restoring cached accessory: ${accessory.displayName}`);
     this.cachedAccessories.set(accessory.UUID, accessory);
   }
-
-  // ── Device discovery ────────────────────────────────────────────────────────
 
   private async discoverDevices(): Promise<void> {
     let devices: HubspaceDevice[];
@@ -107,8 +96,8 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
         this.log.error('    1. Copy the code from your email.');
         this.log.error('    2. Add  "otp": "<code>"  to your Hubspace config.');
         this.log.error('    3. Restart Homebridge.');
-        this.log.error('    4. Once running, remove the "otp" line – it is no');
-        this.log.error('       longer needed after the first successful login.');
+        this.log.error('    4. Once working, remove the "otp" line — it is');
+        this.log.error('       not needed again after the first successful login.');
         this.log.error('══════════════════════════════════════════════════════');
         this.log.error('');
       } else {
@@ -134,14 +123,12 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
       seenUUIDs.add(uuid);
 
       if (this.cachedAccessories.has(uuid)) {
-        // Restore from cache, update context with latest device info
         const cached = this.cachedAccessories.get(uuid)!;
         cached.context.device = device;
         this.api.updatePlatformAccessories([cached]);
         this.registerHandler(Ctor, cached);
         this.log.debug(`Restored: ${device.friendlyName}`);
       } else {
-        // Create new accessory
         const accessory = new this.api.platformAccessory(device.friendlyName, uuid);
         accessory.context.device = device;
         this.registerHandler(Ctor, accessory);
@@ -150,7 +137,6 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
       }
     }
 
-    // Remove accessories that no longer exist in the Hubspace account
     for (const [uuid, accessory] of this.cachedAccessories) {
       if (!seenUUIDs.has(uuid)) {
         this.log.info(`Removing stale accessory: ${accessory.displayName}`);
@@ -170,12 +156,9 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
     }
   }
 
-  // ── Polling ─────────────────────────────────────────────────────────────────
-
   private startPolling(): void {
     const intervalSec = (this.config['pollingInterval'] as number | undefined) ?? 30;
     const intervalMs = Math.max(intervalSec, 10) * 1000;
-
     this.log.debug(`Starting state polling every ${intervalSec}s`);
     this.pollingTimer = setInterval(() => this.pollAll(), intervalMs);
   }
@@ -188,7 +171,6 @@ export class HubspacePlatform implements DynamicPlatformPlugin {
   }
 
   private async pollAll(): Promise<void> {
-    const handlers = Array.from(this.accessories.values());
-    await Promise.allSettled(handlers.map((h) => h.refresh()));
+    await Promise.allSettled(Array.from(this.accessories.values()).map((h) => h.refresh()));
   }
 }
