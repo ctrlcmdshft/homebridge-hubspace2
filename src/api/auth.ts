@@ -167,7 +167,7 @@ export async function login(
     const saved = otpStore.load();
     if (saved) {
       log('[auth] Submitting OTP against saved session (no new credential POST)');
-      const { code } = await submitOtp(otp, saved.sessionCode, saved.execution, saved.tabId, '', log);
+      const { code } = await submitOtp(otp, saved.sessionCode, saved.execution, saved.tabId, saved.cookies, log);
       otpStore.clear();
       const tokens = await exchangeCodeForTokens(code, saved.pkceVerifier);
       return tokensToAuthState(tokens);
@@ -269,6 +269,7 @@ export async function login(
       execution: otpExecution,
       tabId: otpTabId,
       pkceVerifier: verifier,
+      cookies, // carry Keycloak session cookies so OTP POST doesn't get 400
       createdAt: Date.now(),
     });
 

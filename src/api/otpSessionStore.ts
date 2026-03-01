@@ -6,6 +6,7 @@ export interface OtpSession {
   execution: string;
   tabId: string;
   pkceVerifier: string;
+  cookies: string; // Keycloak session cookies from credential POST
   createdAt: number; // ms epoch
 }
 
