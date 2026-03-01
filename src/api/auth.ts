@@ -17,11 +17,6 @@ function generatePKCE(): { verifier: string; challenge: string } {
 
 // ── HTML parsing helpers ──────────────────────────────────────────────────────
 
-function extractFormParam(html: string, name: string): string | undefined {
-  const match = html.match(new RegExp(`name="${name}"[^>]*value="([^"]*)"`));
-  return match?.[1];
-}
-
 /** Extract query params from a URL string */
 function extractQueryParam(url: string, key: string): string | undefined {
   try {

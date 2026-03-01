@@ -27,7 +27,7 @@ export class TokenStore {
   save(state: AuthState): void {
     try {
       fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2), 'utf8');
-    } catch (err) {
+    } catch {
       // non-fatal — worst case the user re-authenticates on next restart
     }
   }
