@@ -15,6 +15,27 @@ function generatePKCE(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
+// ── Cookie helpers ────────────────────────────────────────────────────────────
+
+/** Collect Set-Cookie headers from a response into a single Cookie header string */
+function parseCookies(setCookieHeader: string | string[] | undefined): string {
+  if (!setCookieHeader) return '';
+  const headers = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+  return headers
+    .map((h) => h.split(';')[0].trim()) // keep only name=value, drop path/domain/etc.
+    .join('; ');
+}
+
+/** Merge two cookie strings, with newCookies overwriting duplicates */
+function mergeCookies(existing: string, newCookies: string): string {
+  const map = new Map<string, string>();
+  for (const part of [...existing.split('; '), ...newCookies.split('; ')]) {
+    const [name, ...rest] = part.split('=');
+    if (name) map.set(name.trim(), rest.join('='));
+  }
+  return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
 // ── HTML parsing helpers ──────────────────────────────────────────────────────
 
 /** Extract query params from a URL string */
@@ -30,7 +51,6 @@ function extractQueryParam(url: string, key: string): string | undefined {
 
 /** Extract the authorization code from a redirect URI (custom scheme) */
 function extractAuthCode(locationHeader: string): string | null {
-  // hubspace-app://loginredirect?code=XXX
   const match = locationHeader.match(/[?&]code=([^&]+)/);
   return match ? match[1] : null;
 }
@@ -74,21 +94,22 @@ export async function login(username: string, password: string, otp?: string): P
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('scope', 'openid offline_access');
 
-  // Step 1 – fetch login page (do NOT follow redirects automatically)
+  // Step 1 – fetch login page; Keycloak sets session cookies we must carry forward
   const loginPageResp = await axios.get<string>(authUrl.toString(), {
     maxRedirects: 0,
     validateStatus: (s) => s < 400,
     headers: { 'User-Agent': HUBSPACE_API.USER_AGENT },
   });
 
+  // Capture cookies set by the auth server and carry them through the whole flow
+  let cookies = parseCookies(loginPageResp.headers['set-cookie']);
+
   let authCode: string | null = null;
 
-  // If already redirected (no OTP, maybe cached session), grab the code directly
+  // Already redirected (cached session) — grab the code directly
   if (loginPageResp.status === 302 || loginPageResp.status === 301) {
     const location = loginPageResp.headers['location'] as string | undefined;
-    if (location) {
-      authCode = extractAuthCode(location);
-    }
+    if (location) authCode = extractAuthCode(location);
   }
 
   if (!authCode) {
@@ -106,10 +127,11 @@ export async function login(username: string, password: string, otp?: string): P
     const clientId = extractQueryParam(formAction, 'client_id');
     const tabId = extractQueryParam(formAction, 'tab_id');
 
-    const submitUrl = `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
+    const submitUrl =
+      `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
       `?session_code=${sessionCode}&execution=${execution}&client_id=${clientId}&tab_id=${tabId}`;
 
-    // Step 2 – submit credentials
+    // Step 2 – submit credentials, forwarding the session cookies
     const loginResp = await axios.post(
       submitUrl,
       new URLSearchParams({ username, password, credentialId: '' }).toString(),
@@ -120,19 +142,22 @@ export async function login(username: string, password: string, otp?: string): P
           'Content-Type': 'application/x-www-form-urlencoded',
           'x-requested-with': 'io.afero.partner.hubspace',
           'User-Agent': HUBSPACE_API.USER_AGENT,
+          ...(cookies ? { Cookie: cookies } : {}),
         },
       },
     );
+
+    // Merge any new cookies from the credential response
+    cookies = mergeCookies(cookies, parseCookies(loginResp.headers['set-cookie']));
 
     const location = loginResp.headers['location'] as string | undefined;
 
     // OTP required?
     if (loginResp.status === 200 && loginResp.data && (loginResp.data as string).includes('kc-otp-login-form')) {
       if (!otp) {
-        throw new Error('OTP_REQUIRED: This account requires a one-time password. Provide it via the "otp" parameter.');
+        throw new Error('OTP_REQUIRED');
       }
 
-      // Extract new session params from the OTP form
       const otpHtml = loginResp.data as string;
       const otpFormMatch = otpHtml.match(/action="([^"]+)"/);
       if (!otpFormMatch) {
@@ -144,7 +169,8 @@ export async function login(username: string, password: string, otp?: string): P
       const otpClientId = extractQueryParam(otpFormAction, 'client_id');
       const otpTabId = extractQueryParam(otpFormAction, 'tab_id');
 
-      const otpSubmitUrl = `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
+      const otpSubmitUrl =
+        `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
         `?session_code=${otpSessionCode}&execution=${otpExecution}&client_id=${otpClientId}&tab_id=${otpTabId}`;
 
       const otpResp = await axios.post(
@@ -157,14 +183,13 @@ export async function login(username: string, password: string, otp?: string): P
             'Content-Type': 'application/x-www-form-urlencoded',
             'x-requested-with': 'io.afero.partner.hubspace',
             'User-Agent': HUBSPACE_API.USER_AGENT,
+            ...(cookies ? { Cookie: cookies } : {}),
           },
         },
       );
 
       const otpLocation = otpResp.headers['location'] as string | undefined;
-      if (otpLocation) {
-        authCode = extractAuthCode(otpLocation);
-      }
+      if (otpLocation) authCode = extractAuthCode(otpLocation);
     } else if (location) {
       authCode = extractAuthCode(location);
     }
