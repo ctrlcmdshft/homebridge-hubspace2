@@ -17,28 +17,25 @@ function generatePKCE(): { verifier: string; challenge: string } {
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 
-/** Collect Set-Cookie headers from a response into a single Cookie header string */
 function parseCookies(setCookieHeader: string | string[] | undefined): string {
   if (!setCookieHeader) return '';
   const headers = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
   return headers
-    .map((h) => h.split(';')[0].trim()) // keep only name=value, drop path/domain/etc.
+    .map((h) => h.split(';')[0].trim())
     .join('; ');
 }
 
-/** Merge two cookie strings, with newCookies overwriting duplicates */
 function mergeCookies(existing: string, newCookies: string): string {
   const map = new Map<string, string>();
   for (const part of [...existing.split('; '), ...newCookies.split('; ')]) {
-    const [name, ...rest] = part.split('=');
-    if (name) map.set(name.trim(), rest.join('='));
+    const eq = part.indexOf('=');
+    if (eq > 0) map.set(part.slice(0, eq).trim(), part.slice(eq + 1));
   }
   return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// ── HTML parsing helpers ──────────────────────────────────────────────────────
+// ── HTML / URL helpers ────────────────────────────────────────────────────────
 
-/** Extract query params from a URL string */
 function extractQueryParam(url: string, key: string): string | undefined {
   try {
     const parsed = new URL(url.startsWith('http') ? url : `https://x.com${url}`);
@@ -49,9 +46,8 @@ function extractQueryParam(url: string, key: string): string | undefined {
   }
 }
 
-/** Extract the authorization code from a redirect URI (custom scheme) */
-function extractAuthCode(locationHeader: string): string | null {
-  const match = locationHeader.match(/[?&]code=([^&]+)/);
+function extractAuthCode(location: string): string | null {
+  const match = location.match(/[?&]code=([^&]+)/);
   return match ? match[1] : null;
 }
 
@@ -79,9 +75,62 @@ async function exchangeCodeForTokens(code: string, verifier: string): Promise<To
   return response.data;
 }
 
+// ── Redirect follower ─────────────────────────────────────────────────────────
+
+/**
+ * Follow HTTP redirects manually so we can carry cookies at each hop.
+ * Stops when we reach the hubspace-app:// custom scheme (which axios
+ * cannot fetch) or when there are no more Location headers.
+ * Returns the final Location value that contains the auth code.
+ */
+async function followRedirects(
+  startUrl: string,
+  cookies: string,
+  log: (msg: string) => void,
+): Promise<{ authCode: string | null; cookies: string }> {
+  let currentUrl = startUrl;
+  let currentCookies = cookies;
+
+  for (let hop = 0; hop < 5; hop++) {
+    log(`[auth] redirect hop ${hop + 1}: ${currentUrl}`);
+
+    // Custom scheme — can't fetch, but the URL itself contains the code
+    if (!currentUrl.startsWith('http')) {
+      return { authCode: extractAuthCode(currentUrl), cookies: currentCookies };
+    }
+
+    const resp = await axios.get(currentUrl, {
+      maxRedirects: 0,
+      validateStatus: (s) => s < 400,
+      headers: {
+        'User-Agent': HUBSPACE_API.USER_AGENT,
+        ...(currentCookies ? { Cookie: currentCookies } : {}),
+      },
+    });
+
+    currentCookies = mergeCookies(currentCookies, parseCookies(resp.headers['set-cookie']));
+    log(`[auth] hop ${hop + 1} status: ${resp.status}`);
+
+    const location = resp.headers['location'] as string | undefined;
+    if (!location) break;
+
+    const code = extractAuthCode(location);
+    if (code) return { authCode: code, cookies: currentCookies };
+
+    currentUrl = location.startsWith('http') ? location : `https://${HUBSPACE_API.AUTH_HOST}${location}`;
+  }
+
+  return { authCode: null, cookies: currentCookies };
+}
+
 // ── Main login flow ───────────────────────────────────────────────────────────
 
-export async function login(username: string, password: string, otp?: string): Promise<AuthState> {
+export async function login(
+  username: string,
+  password: string,
+  otp?: string,
+  log: (msg: string) => void = () => { /* no-op */ },
+): Promise<AuthState> {
   const { verifier, challenge } = generatePKCE();
 
   const authUrl = new URL(
@@ -94,33 +143,41 @@ export async function login(username: string, password: string, otp?: string): P
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('scope', 'openid offline_access');
 
-  // Step 1 – fetch login page; Keycloak sets session cookies we must carry forward
+  // Step 1 – fetch login page
+  log('[auth] fetching login page');
   const loginPageResp = await axios.get<string>(authUrl.toString(), {
     maxRedirects: 0,
     validateStatus: (s) => s < 400,
     headers: { 'User-Agent': HUBSPACE_API.USER_AGENT },
   });
 
-  // Capture cookies set by the auth server and carry them through the whole flow
+  log(`[auth] login page status: ${loginPageResp.status}`);
   let cookies = parseCookies(loginPageResp.headers['set-cookie']);
+  log(`[auth] cookies captured: ${cookies ? 'yes' : 'none'}`);
 
   let authCode: string | null = null;
 
-  // Already redirected (cached session) — grab the code directly
+  // Already redirected — cached session
   if (loginPageResp.status === 302 || loginPageResp.status === 301) {
     const location = loginPageResp.headers['location'] as string | undefined;
-    if (location) authCode = extractAuthCode(location);
+    log(`[auth] immediate redirect to: ${location}`);
+    if (location) {
+      authCode = extractAuthCode(location);
+      if (!authCode && location.startsWith('http')) {
+        ({ authCode, cookies } = await followRedirects(location, cookies, log));
+      }
+    }
   }
 
   if (!authCode) {
     const html = loginPageResp.data as string;
 
-    // Extract session parameters embedded in the form action URL
     const formActionMatch = html.match(/action="([^"]+)"/);
     if (!formActionMatch) {
-      throw new Error('Could not find login form action URL');
+      throw new Error('Could not find login form action URL in the Hubspace login page');
     }
     const formAction = formActionMatch[1].replace(/&amp;/g, '&');
+    log(`[auth] form action: ${formAction}`);
 
     const sessionCode = extractQueryParam(formAction, 'session_code');
     const execution = extractQueryParam(formAction, 'execution');
@@ -131,7 +188,8 @@ export async function login(username: string, password: string, otp?: string): P
       `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
       `?session_code=${sessionCode}&execution=${execution}&client_id=${clientId}&tab_id=${tabId}`;
 
-    // Step 2 – submit credentials, forwarding the session cookies
+    // Step 2 – submit credentials
+    log('[auth] submitting credentials');
     const loginResp = await axios.post(
       submitUrl,
       new URLSearchParams({ username, password, credentialId: '' }).toString(),
@@ -147,31 +205,28 @@ export async function login(username: string, password: string, otp?: string): P
       },
     );
 
-    // Merge any new cookies from the credential response
+    log(`[auth] credential POST status: ${loginResp.status}`);
     cookies = mergeCookies(cookies, parseCookies(loginResp.headers['set-cookie']));
 
     const location = loginResp.headers['location'] as string | undefined;
+    log(`[auth] credential POST location: ${location ?? 'none'}`);
 
     // OTP required?
-    if (loginResp.status === 200 && loginResp.data && (loginResp.data as string).includes('kc-otp-login-form')) {
-      if (!otp) {
-        throw new Error('OTP_REQUIRED');
-      }
+    if (loginResp.status === 200 && typeof loginResp.data === 'string' && loginResp.data.includes('kc-otp-login-form')) {
+      log('[auth] OTP required');
+      if (!otp) throw new Error('OTP_REQUIRED');
 
-      const otpHtml = loginResp.data as string;
+      const otpHtml = loginResp.data;
       const otpFormMatch = otpHtml.match(/action="([^"]+)"/);
-      if (!otpFormMatch) {
-        throw new Error('Could not parse OTP form');
-      }
-      const otpFormAction = otpFormMatch[1].replace(/&amp;/g, '&');
-      const otpSessionCode = extractQueryParam(otpFormAction, 'session_code');
-      const otpExecution = extractQueryParam(otpFormAction, 'execution');
-      const otpClientId = extractQueryParam(otpFormAction, 'client_id');
-      const otpTabId = extractQueryParam(otpFormAction, 'tab_id');
+      if (!otpFormMatch) throw new Error('Could not parse OTP form');
 
+      const otpFormAction = otpFormMatch[1].replace(/&amp;/g, '&');
       const otpSubmitUrl =
         `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
-        `?session_code=${otpSessionCode}&execution=${otpExecution}&client_id=${otpClientId}&tab_id=${otpTabId}`;
+        `?session_code=${extractQueryParam(otpFormAction, 'session_code')}` +
+        `&execution=${extractQueryParam(otpFormAction, 'execution')}` +
+        `&client_id=${extractQueryParam(otpFormAction, 'client_id')}` +
+        `&tab_id=${extractQueryParam(otpFormAction, 'tab_id')}`;
 
       const otpResp = await axios.post(
         otpSubmitUrl,
@@ -188,10 +243,28 @@ export async function login(username: string, password: string, otp?: string): P
         },
       );
 
+      log(`[auth] OTP POST status: ${otpResp.status}`);
+      cookies = mergeCookies(cookies, parseCookies(otpResp.headers['set-cookie']));
       const otpLocation = otpResp.headers['location'] as string | undefined;
-      if (otpLocation) authCode = extractAuthCode(otpLocation);
+      log(`[auth] OTP location: ${otpLocation ?? 'none'}`);
+
+      if (otpLocation) {
+        authCode = extractAuthCode(otpLocation);
+        if (!authCode && otpLocation.startsWith('http')) {
+          ({ authCode, cookies } = await followRedirects(otpLocation, cookies, log));
+        }
+      }
     } else if (location) {
       authCode = extractAuthCode(location);
+      // Location might be an intermediate HTTP redirect before the app scheme
+      if (!authCode && location.startsWith('http')) {
+        log('[auth] following intermediate redirect chain');
+        ({ authCode, cookies } = await followRedirects(location, cookies, log));
+      }
+    } else if (loginResp.status === 200) {
+      // 200 with no OTP form = bad credentials
+      log('[auth] server returned 200 with no redirect — likely invalid credentials');
+      throw new Error('Authentication failed: invalid username or password.');
     }
   }
 
@@ -199,7 +272,7 @@ export async function login(username: string, password: string, otp?: string): P
     throw new Error('Authentication failed: could not obtain authorization code. Check your credentials.');
   }
 
-  // Step 3 – exchange code for tokens
+  log('[auth] got authorization code, exchanging for tokens');
   const tokens = await exchangeCodeForTokens(authCode, verifier);
   return tokensToAuthState(tokens);
 }
