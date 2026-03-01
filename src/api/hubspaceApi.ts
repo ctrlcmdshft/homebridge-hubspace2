@@ -58,7 +58,7 @@ export class HubspaceApi {
     // 3. Full login with username + password (+ optional OTP)
     this.log.debug('[HubspaceApi] Logging in');
     try {
-      this.auth = await login(this.username, this.password, this.otp, (msg) => this.log.debug(msg));
+      this.auth = await login(this.username, this.password, this.otp, this.store.storagePath, (msg) => this.log.debug(msg));
     } catch (err) {
       if (err instanceof Error && err.message === 'OTP_REQUIRED') throw new OtpRequiredError();
       throw err;

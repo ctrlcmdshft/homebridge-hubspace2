@@ -6,8 +6,10 @@ const FILE_NAME = 'hubspace-tokens.json';
 
 export class TokenStore {
   private readonly filePath: string;
+  public readonly storagePath: string;
 
   constructor(storagePath: string) {
+    this.storagePath = storagePath;
     this.filePath = path.join(storagePath, FILE_NAME);
   }
 

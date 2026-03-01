@@ -1,27 +1,27 @@
 /**
  * Hubspace authentication — PKCE OAuth2 flow.
  *
- * Ported directly from aioafero (Python) by Expl0dingBanana.
- * The key points:
- *   1. GET the login page, find the <form id="kc-form-login"> action URL
- *   2. POST credentials to that URL (no redirects)
- *   3. If 302  → parse auth code from Location header
- *   4. If 200 + "kc-otp-login-form" in body → OTP required
- *   5. Exchange auth code for tokens
+ * OTP / 2FA session problem and solution:
+ *   Every credential POST creates a new Keycloak session AND triggers a
+ *   new OTP email.  If we restart Homebridge with the emailed code, a new
+ *   credential POST fires first, invalidating the previous session.
  *
- * Cookies from every response are captured and forwarded to the next
- * request so Keycloak's session tracking works without a cookie jar lib.
+ *   Fix: after the credential POST returns the OTP form we save the
+ *   session params + PKCE verifier to disk.  On the next restart, if an
+ *   OTP code is present in config AND a saved session exists on disk, we
+ *   skip the credential POST entirely and submit the OTP directly against
+ *   the saved session (the one that sent the email the user read).
  */
 
 import crypto from 'crypto';
 import axios from 'axios';
 import { HUBSPACE_API } from '../settings';
 import type { AuthState, TokenResponse } from './types';
+import { OtpSessionStore } from './otpSessionStore';
 
 // ── PKCE ──────────────────────────────────────────────────────────────────────
 
 function generatePKCE(): { verifier: string; challenge: string } {
-  // Matches aioafero: base64url(40 random bytes), strip non-alphanumeric
   const verifier = Buffer.from(crypto.randomBytes(40))
     .toString('base64')
     .replace(/[^a-zA-Z0-9]/g, '');
@@ -49,32 +49,22 @@ function mergeCookies(existing: string, incoming: string): string {
   const map = new Map<string, string>();
   for (const chunk of `${existing}; ${incoming}`.split(';')) {
     const eq = chunk.indexOf('=');
-    if (eq > 0) {
-      map.set(chunk.slice(0, eq).trim(), chunk.slice(eq + 1).trim());
-    }
+    if (eq > 0) map.set(chunk.slice(0, eq).trim(), chunk.slice(eq + 1).trim());
   }
-  return Array.from(map.entries())
-    .filter(([k]) => k)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ');
+  return Array.from(map.entries()).filter(([k]) => k).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Find a <form id="formId"> and return its action attribute value.
- * Matches aioafero's BeautifulSoup: auth_page.find("form", id=formId).attrs["action"]
- */
 function extractFormAction(html: string, formId: string): string | null {
-  // The id= and action= attributes can appear in either order
   const pattern = new RegExp(
     `<form[^>]*\\bid="${formId}"[^>]*\\baction="([^"]+)"` +
     `|<form[^>]*\\baction="([^"]+)"[^>]*\\bid="${formId}"`,
     'i',
   );
-  const match = html.match(pattern);
-  if (!match) return null;
-  return (match[1] ?? match[2]).replace(/&amp;/g, '&');
+  const m = html.match(pattern);
+  if (!m) return null;
+  return (m[1] ?? m[2]).replace(/&amp;/g, '&');
 }
 
 function extractQueryParam(url: string, key: string): string {
@@ -92,13 +82,15 @@ function parseAuthCode(location: string): string | null {
   return m ? m[1] : null;
 }
 
+function authUrl(endpoint: string): string {
+  return `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/${endpoint}`;
+}
+
 // ── Token exchange ────────────────────────────────────────────────────────────
 
 async function exchangeCodeForTokens(code: string, verifier: string): Promise<TokenResponse> {
-  const url = `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/protocol/openid-connect/token`;
-
   const res = await axios.post<TokenResponse>(
-    url,
+    authUrl('protocol/openid-connect/token'),
     new URLSearchParams({
       grant_type: 'authorization_code',
       code,
@@ -117,41 +109,96 @@ async function exchangeCodeForTokens(code: string, verifier: string): Promise<To
   return res.data;
 }
 
+// ── OTP submission (reuses a saved session) ───────────────────────────────────
+
+async function submitOtp(
+  otp: string,
+  sessionCode: string,
+  execution: string,
+  tabId: string,
+  cookies: string,
+  log: (msg: string) => void,
+): Promise<{ code: string; status: number }> {
+  const url =
+    authUrl('login-actions/authenticate') +
+    `?session_code=${sessionCode}&execution=${execution}` +
+    `&client_id=${HUBSPACE_API.CLIENT_ID}&tab_id=${tabId}`;
+
+  log('[auth] POST OTP');
+  const resp = await axios.post(
+    url,
+    new URLSearchParams({ action: 'submit', flowName: 'doLogIn', emailCode: otp }).toString(),
+    {
+      maxRedirects: 0,
+      validateStatus: (s) => s < 400,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'x-requested-with': 'io.afero.partner.hubspace',
+        'User-Agent': HUBSPACE_API.USER_AGENT,
+        ...(cookies ? { Cookie: cookies } : {}),
+      },
+    },
+  );
+
+  log(`[auth] OTP POST status=${resp.status}`);
+  const loc = resp.headers['location'] as string | undefined;
+  log(`[auth] OTP location=${loc ?? 'none'}`);
+
+  const code = loc ? parseAuthCode(loc) : null;
+  if (resp.status !== 302 || !code) {
+    throw new Error('Invalid OTP code — the code may have expired. Remove "otp" from config, restart to get a fresh code, then try again.');
+  }
+  return { code, status: resp.status };
+}
+
 // ── Main login flow ───────────────────────────────────────────────────────────
 
 export async function login(
   username: string,
   password: string,
-  otp?: string,
+  otp: string | undefined,
+  storagePath: string,
   log: (msg: string) => void = () => undefined,
 ): Promise<AuthState> {
+  const otpStore = new OtpSessionStore(storagePath);
+
+  // ── Fast path: saved OTP session + code provided ──────────────────────────
+  if (otp) {
+    const saved = otpStore.load();
+    if (saved) {
+      log('[auth] Submitting OTP against saved session (no new credential POST)');
+      const { code } = await submitOtp(otp, saved.sessionCode, saved.execution, saved.tabId, '', log);
+      otpStore.clear();
+      const tokens = await exchangeCodeForTokens(code, saved.pkceVerifier);
+      return tokensToAuthState(tokens);
+    }
+    log('[auth] OTP provided but no saved session found — doing full login to create a new session');
+  }
+
+  // ── Full PKCE login ───────────────────────────────────────────────────────
   const { verifier, challenge } = generatePKCE();
 
-  // ── Step 1: GET login page ────────────────────────────────────────────────
-  const authUrl = new URL(
-    `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/protocol/openid-connect/auth`,
-  );
-  authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('client_id', HUBSPACE_API.CLIENT_ID);
-  authUrl.searchParams.set('redirect_uri', HUBSPACE_API.REDIRECT_URI);
-  authUrl.searchParams.set('code_challenge', challenge);
-  authUrl.searchParams.set('code_challenge_method', 'S256');
-  authUrl.searchParams.set('scope', 'openid offline_access');
+  const loginPageUrl = new URL(authUrl('protocol/openid-connect/auth'));
+  loginPageUrl.searchParams.set('response_type', 'code');
+  loginPageUrl.searchParams.set('client_id', HUBSPACE_API.CLIENT_ID);
+  loginPageUrl.searchParams.set('redirect_uri', HUBSPACE_API.REDIRECT_URI);
+  loginPageUrl.searchParams.set('code_challenge', challenge);
+  loginPageUrl.searchParams.set('code_challenge_method', 'S256');
+  loginPageUrl.searchParams.set('scope', 'openid offline_access');
 
   log('[auth] GET login page');
-  const pageResp = await axios.get<string>(authUrl.toString(), {
+  const pageResp = await axios.get<string>(loginPageUrl.toString(), {
     maxRedirects: 0,
     validateStatus: (s) => s < 400,
     headers: { 'User-Agent': HUBSPACE_API.USER_AGENT },
   });
 
   let cookies = parseCookies(pageResp.headers['set-cookie']);
-  log(`[auth] login page status=${pageResp.status} cookies=${cookies ? 'yes' : 'none'}`);
+  log(`[auth] login page status=${pageResp.status}`);
 
-  // Active session — already redirected
+  // Active session cached — immediate 302
   if (pageResp.status === 302) {
     const loc = pageResp.headers['location'] as string | undefined;
-    log(`[auth] active session redirect → ${loc}`);
     const code = loc ? parseAuthCode(loc) : null;
     if (code) {
       const tokens = await exchangeCodeForTokens(code, verifier);
@@ -159,26 +206,23 @@ export async function login(
     }
   }
 
-  // ── Step 2: Parse kc-form-login and POST credentials ─────────────────────
   const html = pageResp.data as string;
   const formAction = extractFormAction(html, 'kc-form-login');
   if (!formAction) {
-    log('[auth] ERROR: could not find kc-form-login form in login page HTML');
+    log('[auth] ERROR: kc-form-login form not found in login page');
     throw new Error('Could not find login form. The Hubspace login page may have changed.');
   }
-  log(`[auth] form action: ${formAction}`);
 
   const sessionCode = extractQueryParam(formAction, 'session_code');
   const execution = extractQueryParam(formAction, 'execution');
   const tabId = extractQueryParam(formAction, 'tab_id');
-  log(`[auth] session_code=${sessionCode} execution=${execution} tab_id=${tabId}`);
+  log(`[auth] POST credentials session_code=${sessionCode}`);
 
   const submitUrl =
-    `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
+    authUrl('login-actions/authenticate') +
     `?session_code=${sessionCode}&execution=${execution}` +
     `&client_id=${HUBSPACE_API.CLIENT_ID}&tab_id=${tabId}`;
 
-  log('[auth] POST credentials');
   const credResp = await axios.post(
     submitUrl,
     new URLSearchParams({ username, password, credentialId: '' }).toString(),
@@ -198,65 +242,54 @@ export async function login(
   const credLoc = credResp.headers['location'] as string | undefined;
   log(`[auth] credential POST status=${credResp.status} location=${credLoc ?? 'none'}`);
 
-  // ── Step 3a: 302 → success, extract code ─────────────────────────────────
+  // No OTP needed — success
   if (credResp.status === 302 && credLoc) {
     const code = parseAuthCode(credLoc);
     if (code) {
-      log('[auth] got auth code, exchanging for tokens');
       const tokens = await exchangeCodeForTokens(code, verifier);
       return tokensToAuthState(tokens);
     }
   }
 
-  // ── Step 3b: 200 + OTP form ───────────────────────────────────────────────
   const credBody = typeof credResp.data === 'string' ? credResp.data : '';
+
+  // OTP required
   if (credResp.status === 200 && credBody.includes('kc-otp-login-form')) {
-    log('[auth] OTP required');
-    if (!otp) throw new Error('OTP_REQUIRED');
+    log('[auth] OTP required — saving session to disk');
 
+    // Parse the OTP form to get the correct session params for THIS session
     const otpAction = extractFormAction(credBody, 'kc-otp-login-form');
-    if (!otpAction) throw new Error('Could not parse OTP form action');
+    const otpSessionCode = otpAction ? extractQueryParam(otpAction, 'session_code') : sessionCode;
+    const otpExecution = otpAction ? extractQueryParam(otpAction, 'execution') : execution;
+    const otpTabId = otpAction ? extractQueryParam(otpAction, 'tab_id') : tabId;
 
-    const otpSessionCode = extractQueryParam(otpAction, 'session_code');
-    const otpExecution = extractQueryParam(otpAction, 'execution');
-    const otpTabId = extractQueryParam(otpAction, 'tab_id');
+    // Save session so the next restart can submit the OTP without a new credential POST
+    otpStore.save({
+      sessionCode: otpSessionCode,
+      execution: otpExecution,
+      tabId: otpTabId,
+      pkceVerifier: verifier,
+      createdAt: Date.now(),
+    });
 
-    const otpUrl =
-      `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/login-actions/authenticate` +
-      `?session_code=${otpSessionCode}&execution=${otpExecution}` +
-      `&client_id=${HUBSPACE_API.CLIENT_ID}&tab_id=${otpTabId}`;
-
-    log('[auth] POST OTP');
-    const otpResp = await axios.post(
-      otpUrl,
-      new URLSearchParams({ action: 'submit', flowName: 'doLogIn', emailCode: otp }).toString(),
-      {
-        maxRedirects: 0,
-        validateStatus: (s) => s < 400,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'x-requested-with': 'io.afero.partner.hubspace',
-          'User-Agent': HUBSPACE_API.USER_AGENT,
-          ...(cookies ? { Cookie: cookies } : {}),
-        },
-      },
-    );
-
-    const otpLoc = otpResp.headers['location'] as string | undefined;
-    log(`[auth] OTP POST status=${otpResp.status} location=${otpLoc ?? 'none'}`);
-
-    if (otpResp.status !== 302 || !otpLoc) {
-      throw new Error('Invalid OTP code — check your email and try again.');
+    if (otp) {
+      // OTP was provided but we just did a fresh credential POST (old saved session was expired).
+      // Try submitting immediately against this new session.
+      log('[auth] Trying provided OTP against fresh session');
+      try {
+        const { code } = await submitOtp(otp, otpSessionCode, otpExecution, otpTabId, cookies, log);
+        otpStore.clear();
+        const tokens = await exchangeCodeForTokens(code, verifier);
+        return tokensToAuthState(tokens);
+      } catch {
+        // OTP was stale — fall through to raise OTP_REQUIRED so user gets a fresh code
+        log('[auth] Provided OTP did not work against new session — a fresh code was emailed');
+      }
     }
-    const code = parseAuthCode(otpLoc);
-    if (!code) throw new Error('Could not parse auth code from OTP redirect.');
 
-    log('[auth] OTP success, exchanging for tokens');
-    const tokens = await exchangeCodeForTokens(code, verifier);
-    return tokensToAuthState(tokens);
+    throw new Error('OTP_REQUIRED');
   }
 
-  // ── Step 3c: 200 with no OTP form = wrong credentials ────────────────────
   if (credResp.status === 200) {
     throw new Error('Authentication failed: invalid username or password.');
   }
@@ -267,10 +300,8 @@ export async function login(
 // ── Token refresh ─────────────────────────────────────────────────────────────
 
 export async function refreshTokens(refreshToken: string): Promise<AuthState> {
-  const url = `https://${HUBSPACE_API.AUTH_HOST}/auth/realms/${HUBSPACE_API.AUTH_REALM}/protocol/openid-connect/token`;
-
   const res = await axios.post<TokenResponse>(
-    url,
+    authUrl('protocol/openid-connect/token'),
     new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
@@ -287,8 +318,6 @@ export async function refreshTokens(refreshToken: string): Promise<AuthState> {
   );
   return tokensToAuthState(res.data);
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function tokensToAuthState(tokens: TokenResponse): AuthState {
   return {
